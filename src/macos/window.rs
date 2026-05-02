@@ -13,9 +13,39 @@ use cocoa::foundation::{NSAutoreleasePool, NSPoint, NSRect, NSSize, NSString};
 use core_foundation::runloop::{
     CFRunLoop, CFRunLoopTimer, CFRunLoopTimerContext, __CFRunLoopTimer, kCFRunLoopDefaultMode,
 };
+extern "C" {
+    fn CFRunLoopGetMain() -> *mut std::ffi::c_void;
+    fn CFRunLoopStop(rl: *mut std::ffi::c_void);
+    fn CFRunLoopWakeUp(rl: *mut std::ffi::c_void);
+}
+
+// `dispatch_get_main_queue()` is a macro that expands to `&_dispatch_main_q`
+// in modern SDKs — there is no exported function symbol for it. Reference the
+// underlying static directly instead.
+#[link(name = "System", kind = "dylib")]
+extern "C" {
+    static _dispatch_main_q: std::ffi::c_void;
+    fn dispatch_async_f(
+        queue: *mut std::ffi::c_void,
+        context: *mut std::ffi::c_void,
+        work: extern "C" fn(*mut std::ffi::c_void),
+    );
+}
+
+unsafe fn dispatch_main_queue() -> *mut std::ffi::c_void {
+    &_dispatch_main_q as *const _ as *mut std::ffi::c_void
+}
 use keyboard_types::KeyboardEvent;
 use objc::class;
+use objc::runtime::{Class, Object as ObjcObject};
 use objc::{msg_send, runtime::Object, sel, sel_impl};
+extern "C" {
+    fn class_getInstanceVariable(
+        cls: *const Class,
+        name: *const std::os::raw::c_char,
+    ) -> *const std::os::raw::c_void;
+    fn object_getClass(obj: *const ObjcObject) -> *const Class;
+}
 use raw_window_handle::{
     AppKitDisplayHandle, AppKitWindowHandle, HasRawDisplayHandle, HasRawWindowHandle,
     RawDisplayHandle, RawWindowHandle,
@@ -71,39 +101,74 @@ pub(super) struct WindowInner {
 impl WindowInner {
     pub(super) fn close(&self) {
         if self.open.get() {
-            self.open.set(false);
+            // Run shared teardown (which stops the run loop) BEFORE tearing
+            // down the NSWindow. NSWindow's `close` releases its contentView
+            // (our NSView), and `close_inner` accesses `self.ns_view` to
+            // remove it from the superview, fetch its ivar, etc. — doing
+            // that on a released view is UB and silently hangs the close
+            // path. Order: cleanup → stop loop → close NSWindow.
+            self.close_inner();
             unsafe {
-                // Take back ownership of the NSView's Rc<WindowState>
-                let state_ptr: *const c_void = *(*self.ns_view).get_ivar(BASEVIEW_STATE_IVAR);
-                let window_state = Rc::from_raw(state_ptr as *mut WindowState);
-
-                // Cancel the frame timer
-                if let Some(frame_timer) = window_state.frame_timer.take() {
-                    CFRunLoop::get_current().remove_timer(&frame_timer, kCFRunLoopDefaultMode);
-                }
-
-                // Deregister NSView from NotificationCenter.
-                let notification_center: id =
-                    msg_send![class!(NSNotificationCenter), defaultCenter];
-                let () = msg_send![notification_center, removeObserver:self.ns_view];
-
-                drop(window_state);
-
-                // Close the window if in non-parented mode
                 if let Some(ns_window) = self.ns_window.take() {
                     ns_window.close();
                 }
-
-                // Ensure that the NSView is detached from the parent window
-                self.ns_view.removeFromSuperview();
-                let () = msg_send![self.ns_view as id, release];
-
-                // If in non-parented mode, we want to also quit the app altogether
-                let app = self.ns_app.take();
-                if let Some(app) = app {
-                    app.stop_(app);
-                }
             }
+        }
+    }
+
+    /// Shared teardown used by both the programmatic `close()` path and the
+    /// `windowShouldClose:` delegate path.
+    ///
+    /// Split into two phases:
+    /// - Phase 1 (synchronous, here): mark closed, cancel timer, deregister
+    ///   observer, walk up to a baseview ancestor in standalone mode, stop
+    ///   the run loop. NON-destructive — leaves the NSView and the
+    ///   `Rc<WindowState>` alive so that any in-flight handler (e.g. an
+    ///   `on_frame` that's currently calling `window.close()`) can finish
+    ///   safely instead of dereferencing freed renderer state.
+    /// - Phase 2 (deferred via `dispatch_async`): drop the `Rc<WindowState>`,
+    ///   detach + release the NSView. Runs at the start of the next main-queue
+    ///   iteration, by which point the in-flight handler has returned.
+    pub(super) fn close_inner(&self) {
+        if !self.open.get() {
+            return;
+        }
+        self.open.set(false);
+
+        // Snapshot the baseview ancestor (if any) BEFORE we cancel anything,
+        // because the superview chain stays intact only until Phase 2 runs.
+        let baseview_ancestor = unsafe { find_baseview_ancestor(self.ns_view) };
+
+        unsafe {
+            // Cancel the frame timer so no further `on_frame` fires.
+            // (Borrow WindowState briefly via the ivar; do NOT drop it here —
+            // Phase 2 reclaims it.)
+            let state_ptr: *const c_void = *(*self.ns_view).get_ivar(BASEVIEW_STATE_IVAR);
+            let window_state_rc = Rc::from_raw(state_ptr as *mut WindowState);
+            if let Some(frame_timer) = window_state_rc.frame_timer.take() {
+                CFRunLoop::get_current().remove_timer(&frame_timer, kCFRunLoopDefaultMode);
+            }
+            let _ = Rc::into_raw(window_state_rc);
+
+            let notification_center: id =
+                msg_send![class!(NSNotificationCenter), defaultCenter];
+            let () = msg_send![notification_center, removeObserver:self.ns_view];
+
+            schedule_finalize_close(self.ns_view);
+
+            // Run-loop teardown / parent propagation.
+            let app = self.ns_app.take();
+            if let Some(app) = app {
+                app.stop_(app);
+                let main_loop = CFRunLoopGetMain();
+                CFRunLoopStop(main_loop);
+                CFRunLoopWakeUp(main_loop);
+            } else if let Some(parent_state) = baseview_ancestor {
+                // Standalone case: editor parented inside our own outer
+                // baseview window — propagate so the wrapper exits.
+                parent_state.window_inner.close_inner();
+            }
+            // Otherwise (DAW host context): the host owns the run loop, leave it alone.
         }
     }
 
@@ -120,6 +185,68 @@ impl WindowInner {
 
         RawWindowHandle::AppKit(AppKitWindowHandle::empty())
     }
+}
+
+/// Phase-2 teardown: drop the `Rc<WindowState>` stored in the NSView's ivar
+/// and release the NSView itself. Runs on the main queue *after* the current
+/// run-loop iteration, so any in-flight `on_frame` (whose `window.close()`
+/// triggered the close) has fully returned before its `WindowState` and
+/// renderer are dropped.
+extern "C" fn finalize_close_callback(ns_view_ctx: *mut std::ffi::c_void) {
+    unsafe {
+        let ns_view = ns_view_ctx as id;
+        // Reclaim the Rc<WindowState> from the ivar and drop it. This frees
+        // the WindowHandler (egui renderer, GL context, etc.).
+        let state_ptr: *const c_void = *(*ns_view).get_ivar(BASEVIEW_STATE_IVAR);
+        if !state_ptr.is_null() {
+            let window_state = Rc::from_raw(state_ptr as *const WindowState);
+            // Null out the ivar so we never reclaim twice.
+            (*ns_view).set_ivar(BASEVIEW_STATE_IVAR, ptr::null::<c_void>() as *const c_void);
+            drop(window_state);
+        }
+        // Detach from the parent and release our retain.
+        let _: () = msg_send![ns_view, removeFromSuperview];
+        let () = msg_send![ns_view, release];
+    }
+}
+
+unsafe fn schedule_finalize_close(ns_view: id) {
+    dispatch_async_f(
+        dispatch_main_queue(),
+        ns_view as *mut std::ffi::c_void,
+        finalize_close_callback,
+    );
+}
+
+/// Walk up the superview chain looking for an NSView whose class registered
+/// `BASEVIEW_STATE_IVAR` — i.e. another baseview-owned view. If found,
+/// returns a borrowed reference to that view's `WindowInner`.
+///
+/// Used by parented `close_inner` so that, in standalone mode (where the
+/// editor is parented inside our own outer baseview window), closing the
+/// editor also closes the outer window. In a DAW host the parent NSView
+/// belongs to the host and won't have the ivar, so we leave it alone.
+unsafe fn find_baseview_ancestor(view: id) -> Option<Rc<WindowState>> {
+    let ivar_name = std::ffi::CString::new(BASEVIEW_STATE_IVAR).ok()?;
+    let mut current: id = msg_send![view, superview];
+    while current != nil {
+        let class_ptr = object_getClass(current as *const ObjcObject);
+        if !class_ptr.is_null() {
+            let ivar_ptr = class_getInstanceVariable(class_ptr, ivar_name.as_ptr());
+            if !ivar_ptr.is_null() {
+                // This NSView's class registered our ivar — it's a baseview view.
+                let state_ptr: *const c_void = *(*current).get_ivar(BASEVIEW_STATE_IVAR);
+                if !state_ptr.is_null() {
+                    let state_rc = Rc::from_raw(state_ptr as *const WindowState);
+                    let cloned = Rc::clone(&state_rc);
+                    let _ = Rc::into_raw(state_rc);
+                    return Some(cloned);
+                }
+            }
+        }
+        current = msg_send![current, superview];
+    }
+    None
 }
 
 pub struct Window<'a> {
@@ -191,6 +318,13 @@ impl<'a> Window<'a> {
 
         unsafe {
             app.setActivationPolicy_(NSApplicationActivationPolicyRegular);
+            // Bring the app to the foreground. Without this, on macOS a
+            // standalone app launched from a terminal sometimes appears
+            // behind other apps (visible only via Exposé) and clicking the
+            // Dock icon does not bring it forward. `setActivationPolicy:`
+            // alone doesn't activate; an explicit `activateIgnoringOtherApps:`
+            // is required.
+            let () = msg_send![app, activateIgnoringOtherApps: YES];
         }
 
         let scaling = match options.scale {

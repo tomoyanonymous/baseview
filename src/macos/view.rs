@@ -269,9 +269,14 @@ extern "C" fn window_should_close(this: &Object, _: Sel, _sender: id) -> BOOL {
 
     state.trigger_event(Event::Window(WindowEvent::WillClose));
 
-    state.window_inner.close();
+    // Run shared teardown (release view, stop timer, `[NSApp stop:]`) but do
+    // NOT call `ns_window.close()` — let AppKit close the window itself by
+    // returning YES below. This is required for Cmd+Q's `[NSApp terminate:]`
+    // sequence to complete: returning NO here aborts terminate, leaving the
+    // app sitting on a torn-down grey window.
+    state.window_inner.close_inner();
 
-    NO
+    YES
 }
 
 extern "C" fn dealloc(this: &mut Object, _sel: Sel) {
@@ -304,8 +309,15 @@ extern "C" fn view_did_change_backing_properties(this: &Object, _: Sel, _: id) {
 
         let window_info = state.window_info.get();
 
-        // Only send the event when the window's size has actually changed to be in line with the
-        // other platform implementations
+        // Fix for bug 2.4 (NIH_PLUG_HIDPI_ANALYSIS.md) — emit Resized on backing-scale-only
+        // changes so downstream renderers re-rasterize at the new pixels_per_point.
+        // Currently disabled to verify the fix is the actual cause of an observed issue.
+        // if new_window_info.physical_size() != window_info.physical_size()
+        //     || new_window_info.scale() != window_info.scale()
+        // {
+        //     state.window_info.set(new_window_info);
+        //     state.trigger_event(Event::Window(WindowEvent::Resized(new_window_info)));
+        // }
         if new_window_info.physical_size() != window_info.physical_size() {
             state.window_info.set(new_window_info);
             state.trigger_event(Event::Window(WindowEvent::Resized(new_window_info)));
