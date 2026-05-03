@@ -27,3 +27,15 @@ pub struct WindowOpenOptions {
     #[cfg(feature = "opengl")]
     pub gl_config: Option<crate::gl::GlConfig>,
 }
+
+impl Default for WindowOpenOptions {
+    fn default() -> Self {
+        Self {
+            title: String::new(),
+            size: Size { width: 0.0, height: 0.0 },
+            scale: WindowScalePolicy::SystemScaleFactor,
+            #[cfg(feature = "opengl")]
+            gl_config: None,
+        }
+    }
+}
